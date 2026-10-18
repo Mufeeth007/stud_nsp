@@ -1,259 +1,414 @@
-import os
-import sys
-import logging
-from flask import Flask, request, jsonify, render_template
-from db import (
-    init_db,
-    check_db_health,
-    get_all_students,
-    get_student_by_id,
-    create_student,
-    update_student,
-    delete_student,
-    DatabaseConfigError,
-    DatabaseConnectionError,
-    DuplicateRecordError,
-    RecordNotFoundError,
-    ValidationError,
-    get_masked_db_url
-)
+"""
+Student Records Management System - Flask Backend
+REST API endpoints for managing student records with PostgreSQL.
+"""
 
-# Initialize Flask application
+import os
+import re
+from flask import Flask, request, jsonify, render_template
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from psycopg2.errors import UniqueViolation
+
+from db import get_db_connection, init_db
+
 app = Flask(__name__)
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger("student_app")
+# Basic email regex validation pattern
+EMAIL_REGEX = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
 
 
-def serialize_student(student: dict) -> dict:
-    """Format student dictionary for JSON serialization."""
-    if not student:
-        return {}
-    res = dict(student)
-    if res.get("created_at") and hasattr(res["created_at"], "isoformat"):
-        res["created_at"] = res["created_at"].isoformat()
-    return res
+def validate_student_data(data, is_update=False):
+    """
+    Validates student payload fields.
+    Returns (is_valid, error_message, cleaned_data).
+    """
+    if not isinstance(data, dict):
+        return False, "Invalid request payload. Expected JSON object.", None
+
+    name = str(data.get("name", "")).strip()
+    register_number = str(data.get("register_number", "")).strip()
+    department = str(data.get("department", "")).strip()
+    email = str(data.get("email", "")).strip()
+    academic_year = str(data.get("academic_year", "")).strip()
+
+    # Validate required fields
+    if not name:
+        return False, "Student Name is required.", None
+    if len(name) > 100:
+        return False, "Student Name cannot exceed 100 characters.", None
+
+    if not register_number:
+        return False, "Register Number is required.", None
+    if len(register_number) > 50:
+        return False, "Register Number cannot exceed 50 characters.", None
+
+    if not department:
+        return False, "Department is required.", None
+    if len(department) > 100:
+        return False, "Department cannot exceed 100 characters.", None
+
+    if not email:
+        return False, "Email Address is required.", None
+    if not re.match(EMAIL_REGEX, email):
+        return False, "Please enter a valid email address (e.g., student@example.com).", None
+    if len(email) > 120:
+        return False, "Email Address cannot exceed 120 characters.", None
+
+    if not academic_year:
+        return False, "Academic Year is required.", None
+    if len(academic_year) > 50:
+        return False, "Academic Year cannot exceed 50 characters.", None
+
+    cleaned_data = {
+        "name": name,
+        "register_number": register_number,
+        "department": department,
+        "email": email,
+        "academic_year": academic_year
+    }
+
+    return True, None, cleaned_data
 
 
-# ------------------------------------------------------------------------------
-# Frontend Page
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------
+# Web Routes
+# ---------------------------------------------------------
 @app.route("/")
 def index():
     """Serves the main single-page application dashboard."""
     return render_template("index.html")
 
 
-# ------------------------------------------------------------------------------
-# Health Check Endpoint
-# ------------------------------------------------------------------------------
-@app.route("/api/health", methods=["GET"])
-def health_check():
-    """
-    Check application and PostgreSQL database connectivity.
-    Reports connection status, PostgreSQL version, and total records.
-    """
-    health = check_db_health()
-    if health.get("status") == "healthy":
-        return jsonify(health), 200
-    elif health.get("status") == "unconfigured":
-        return jsonify(health), 503
-    else:
-        return jsonify(health), 503
+# ---------------------------------------------------------
+# REST API Endpoints
+# ---------------------------------------------------------
 
-
-# ------------------------------------------------------------------------------
-# Student Records API Endpoints
-# ------------------------------------------------------------------------------
 @app.route("/api/students", methods=["GET"])
-def list_students():
+def get_students():
     """
-    Retrieve all students.
-    Supports optional search parameter: /api/students?search=<term>
-    Searches across name, register_number, and department.
+    GET /api/students
+    Retrieve all students from the database.
+    Supports optional search filter: /api/students?search=keyword
     """
-    search_query = request.args.get("search", default=None, type=str)
+    search_query = request.args.get("search", "").strip()
+    conn = None
     try:
-        students = get_all_students(search_query)
-        serialized = [serialize_student(s) for s in students]
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if search_query:
+                # Search by student name OR register number (case-insensitive)
+                query = """
+                SELECT id, name, register_number, department, email, academic_year,
+                       to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') as created_at
+                FROM students
+                WHERE name ILIKE %s OR register_number ILIKE %s
+                ORDER BY id ASC;
+                """
+                search_param = f"%{search_query}%"
+                cur.execute(query, (search_param, search_param))
+            else:
+                query = """
+                SELECT id, name, register_number, department, email, academic_year,
+                       to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') as created_at
+                FROM students
+                ORDER BY id ASC;
+                """
+                cur.execute(query)
+
+            students = cur.fetchall()
+
         return jsonify({
-            "count": len(serialized),
-            "students": serialized,
-            "search_query": search_query
+            "success": True,
+            "students": students,
+            "total": len(students)
         }), 200
-    except (DatabaseConfigError, DatabaseConnectionError) as e:
-        logger.error(f"Database error in list_students: {e}")
+
+    except psycopg2.OperationalError as e:
         return jsonify({
-            "error": "Database connection error",
-            "details": str(e)
-        }), 503
-    except Exception as e:
-        logger.error(f"Unexpected error in list_students: {e}")
-        return jsonify({
-            "error": "Failed to retrieve student records",
-            "details": str(e)
+            "success": False,
+            "error": "Database connection error. Please make sure PostgreSQL is running and .env is configured correctly."
         }), 500
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": f"An error occurred while fetching students: {str(e)}"
+        }), 500
+    finally:
+        if conn:
+            conn.close()
 
 
 @app.route("/api/students/<int:student_id>", methods=["GET"])
-def get_student(student_id: int):
-    """Retrieve details of a single student by ID."""
+def get_student(student_id):
+    """
+    GET /api/students/<id>
+    Retrieve a single student record by primary key ID.
+    """
+    conn = None
     try:
-        student = get_student_by_id(student_id)
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            query = """
+            SELECT id, name, register_number, department, email, academic_year,
+                   to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') as created_at
+            FROM students
+            WHERE id = %s;
+            """
+            cur.execute(query, (student_id,))
+            student = cur.fetchone()
+
+        if not student:
+            return jsonify({
+                "success": False,
+                "error": f"Student with ID {student_id} not found."
+            }), 404
+
         return jsonify({
-            "student": serialize_student(student)
+            "success": True,
+            "student": student
         }), 200
-    except RecordNotFoundError as e:
-        return jsonify({"error": str(e)}), 404
-    except (DatabaseConfigError, DatabaseConnectionError) as e:
+
+    except psycopg2.OperationalError:
         return jsonify({
-            "error": "Database connection error",
-            "details": str(e)
-        }), 503
-    except Exception as e:
-        logger.error(f"Unexpected error in get_student: {e}")
-        return jsonify({
-            "error": "Failed to fetch student record",
-            "details": str(e)
+            "success": False,
+            "error": "Database connection error. Please make sure PostgreSQL is running."
         }), 500
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": f"An error occurred while fetching student details: {str(e)}"
+        }), 500
+    finally:
+        if conn:
+            conn.close()
 
 
 @app.route("/api/students", methods=["POST"])
 def add_student():
     """
-    Create a new student record.
-    Expects JSON: {name, register_number, department, email, academic_year}
+    POST /api/students
+    Add a new student record to the database.
     """
-    data = request.get_json(silent=True)
-    if not data:
-        return jsonify({
-            "error": "Invalid request body. Expected JSON object with student details."
-        }), 400
+    data = request.get_json(silent=True) or request.form.to_dict()
+    is_valid, error_msg, cleaned = validate_student_data(data)
+    if not is_valid:
+        return jsonify({"success": False, "error": error_msg}), 400
 
+    conn = None
     try:
-        new_student = create_student(data)
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Check for duplicate register number
+            check_sql = "SELECT id FROM students WHERE register_number = %s;"
+            cur.execute(check_sql, (cleaned["register_number"],))
+            existing = cur.fetchone()
+            if existing:
+                return jsonify({
+                    "success": False,
+                    "error": f"A student with Register Number '{cleaned['register_number']}' already exists."
+                }), 409
+
+            # Insert new student record
+            insert_sql = """
+            INSERT INTO students (name, register_number, department, email, academic_year)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id, name, register_number, department, email, academic_year,
+                      to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') as created_at;
+            """
+            cur.execute(insert_sql, (
+                cleaned["name"],
+                cleaned["register_number"],
+                cleaned["department"],
+                cleaned["email"],
+                cleaned["academic_year"]
+            ))
+            new_student = cur.fetchone()
+
+        conn.commit()
+
         return jsonify({
-            "message": "Student record created successfully.",
-            "student": serialize_student(new_student)
+            "success": True,
+            "message": "Student record added successfully!",
+            "student": new_student
         }), 201
-    except ValidationError as e:
-        return jsonify({"error": str(e)}), 400
-    except DuplicateRecordError as e:
-        return jsonify({"error": str(e)}), 409
-    except (DatabaseConfigError, DatabaseConnectionError) as e:
+
+    except UniqueViolation:
+        if conn:
+            conn.rollback()
         return jsonify({
-            "error": "Database connection error",
-            "details": str(e)
-        }), 503
-    except Exception as e:
-        logger.error(f"Unexpected error in add_student: {e}")
+            "success": False,
+            "error": f"A student with Register Number '{cleaned['register_number']}' already exists."
+        }), 409
+    except psycopg2.OperationalError:
+        if conn:
+            conn.rollback()
         return jsonify({
-            "error": "Failed to create student record",
-            "details": str(e)
+            "success": False,
+            "error": "Database connection error. Please make sure PostgreSQL is running."
         }), 500
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        return jsonify({
+            "success": False,
+            "error": f"Failed to add student: {str(e)}"
+        }), 500
+    finally:
+        if conn:
+            conn.close()
 
 
 @app.route("/api/students/<int:student_id>", methods=["PUT"])
-def edit_student(student_id: int):
+def update_student(student_id):
     """
-    Update an existing student record by ID.
-    Expects JSON: {name, register_number, department, email, academic_year}
+    PUT /api/students/<id>
+    Update an existing student record by primary key ID.
     """
-    data = request.get_json(silent=True)
-    if not data:
-        return jsonify({
-            "error": "Invalid request body. Expected JSON object with updated details."
-        }), 400
+    data = request.get_json(silent=True) or request.form.to_dict()
+    is_valid, error_msg, cleaned = validate_student_data(data, is_update=True)
+    if not is_valid:
+        return jsonify({"success": False, "error": error_msg}), 400
 
+    conn = None
     try:
-        updated = update_student(student_id, data)
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Verify student exists
+            cur.execute("SELECT id FROM students WHERE id = %s;", (student_id,))
+            student_exists = cur.fetchone()
+            if not student_exists:
+                return jsonify({
+                    "success": False,
+                    "error": f"Student with ID {student_id} not found."
+                }), 404
+
+            # Check if updated register number belongs to another student
+            check_sql = "SELECT id FROM students WHERE register_number = %s AND id != %s;"
+            cur.execute(check_sql, (cleaned["register_number"], student_id))
+            duplicate = cur.fetchone()
+            if duplicate:
+                return jsonify({
+                    "success": False,
+                    "error": f"A different student already has Register Number '{cleaned['register_number']}'."
+                }), 409
+
+            # Update record
+            update_sql = """
+            UPDATE students
+            SET name = %s,
+                register_number = %s,
+                department = %s,
+                email = %s,
+                academic_year = %s
+            WHERE id = %s
+            RETURNING id, name, register_number, department, email, academic_year,
+                      to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') as created_at;
+            """
+            cur.execute(update_sql, (
+                cleaned["name"],
+                cleaned["register_number"],
+                cleaned["department"],
+                cleaned["email"],
+                cleaned["academic_year"],
+                student_id
+            ))
+            updated_student = cur.fetchone()
+
+        conn.commit()
+
         return jsonify({
-            "message": "Student record updated successfully.",
-            "student": serialize_student(updated)
+            "success": True,
+            "message": "Student record updated successfully!",
+            "student": updated_student
         }), 200
-    except ValidationError as e:
-        return jsonify({"error": str(e)}), 400
-    except RecordNotFoundError as e:
-        return jsonify({"error": str(e)}), 404
-    except DuplicateRecordError as e:
-        return jsonify({"error": str(e)}), 409
-    except (DatabaseConfigError, DatabaseConnectionError) as e:
+
+    except UniqueViolation:
+        if conn:
+            conn.rollback()
         return jsonify({
-            "error": "Database connection error",
-            "details": str(e)
-        }), 503
-    except Exception as e:
-        logger.error(f"Unexpected error in edit_student: {e}")
+            "success": False,
+            "error": f"A student with Register Number '{cleaned['register_number']}' already exists."
+        }), 409
+    except psycopg2.OperationalError:
+        if conn:
+            conn.rollback()
         return jsonify({
-            "error": "Failed to update student record",
-            "details": str(e)
+            "success": False,
+            "error": "Database connection error. Please make sure PostgreSQL is running."
         }), 500
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        return jsonify({
+            "success": False,
+            "error": f"Failed to update student: {str(e)}"
+        }), 500
+    finally:
+        if conn:
+            conn.close()
 
 
 @app.route("/api/students/<int:student_id>", methods=["DELETE"])
-def remove_student(student_id: int):
-    """Delete a student record by ID."""
+def delete_student(student_id):
+    """
+    DELETE /api/students/<id>
+    Delete a student record by primary key ID.
+    """
+    conn = None
     try:
-        deleted = delete_student(student_id)
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM students WHERE id = %s RETURNING id;", (student_id,))
+            deleted = cur.fetchone()
+
+        if not deleted:
+            return jsonify({
+                "success": False,
+                "error": f"Student with ID {student_id} not found."
+            }), 404
+
+        conn.commit()
+
         return jsonify({
-            "message": f"Student '{deleted['name']}' (Register No: {deleted['register_number']}) was successfully deleted.",
-            "deleted_id": student_id
+            "success": True,
+            "message": f"Student record #{student_id} was successfully deleted."
         }), 200
-    except RecordNotFoundError as e:
-        return jsonify({"error": str(e)}), 404
-    except (DatabaseConfigError, DatabaseConnectionError) as e:
+
+    except psycopg2.OperationalError:
+        if conn:
+            conn.rollback()
         return jsonify({
-            "error": "Database connection error",
-            "details": str(e)
-        }), 503
-    except Exception as e:
-        logger.error(f"Unexpected error in remove_student: {e}")
-        return jsonify({
-            "error": "Failed to delete student record",
-            "details": str(e)
+            "success": False,
+            "error": "Database connection error. Please make sure PostgreSQL is running."
         }), 500
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        return jsonify({
+            "success": False,
+            "error": f"Failed to delete student: {str(e)}"
+        }), 500
+    finally:
+        if conn:
+            conn.close()
 
 
-# ------------------------------------------------------------------------------
-# Generic Error Handlers
-# ------------------------------------------------------------------------------
-@app.errorhandler(404)
-def not_found(e):
-    if request.path.startswith("/api/"):
-        return jsonify({"error": "Resource or endpoint not found"}), 404
-    return render_template("index.html"), 404
-
-
-@app.errorhandler(500)
-def server_error(e):
-    return jsonify({"error": "Internal server error"}), 500
-
-
-# ------------------------------------------------------------------------------
-# Server Startup
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------
+# Application Startup
+# ---------------------------------------------------------
 if __name__ == "__main__":
-    print("=" * 70)
-    print("  Student Records System - Nostromo PostgreSQL Test Harness")
-    print("=" * 70)
-    print(f"  Configured Database URI: {get_masked_db_url()}")
-    print("  Attempting initial schema verification...")
-    
-    # Attempt to initialize schema
-    success, msg = init_db()
-    if success:
-        print("  [SUCCESS] PostgreSQL schema initialized successfully.")
-    else:
-        print(f"  [NOTICE] Schema verification pending: {msg}")
-        print("  You can update your .env file at any time without changing code.")
-    print("=" * 70)
-    print("  Starting Flask Web Server on http://127.0.0.1:5000 ...")
-    print("=" * 70)
-    
-    # Run development server
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # Attempt automatic database & table initialization
+    try:
+        init_db()
+    except Exception as err:
+        print("\n" + "=" * 60)
+        print("NOTE: Database initialization could not be completed.")
+        print(f"Detail: {err}")
+        print("Please ensure PostgreSQL is installed, running, and student_db is created.")
+        print("Update your .env file with your PostgreSQL password.")
+        print("=" * 60 + "\n")
+
+    port = int(os.getenv("PORT", 5000))
+    print(f"Starting Student Records Management System on http://127.0.0.1:{port}")
+    app.run(host="0.0.0.0", port=port, debug=True)
