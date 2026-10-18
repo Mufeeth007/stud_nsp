@@ -1,6 +1,7 @@
 """
 Database Module for Student Records Management System
 Handles PostgreSQL connection and automatic table creation using psycopg2.
+Supports both DATABASE_URL (Nostromo / Cloud) and individual environment variables.
 """
 
 import os
@@ -16,19 +17,33 @@ def get_db_connection():
     """
     Creates and returns a connection to the PostgreSQL database.
     Reads configuration from environment variables.
+    Supports DATABASE_URL (Nostromo / production environments)
+    as well as individual DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD.
     """
+    database_url = os.getenv("DATABASE_URL")
     db_host = os.getenv("DB_HOST", "localhost")
     db_port = os.getenv("DB_PORT", "5432")
     db_name = os.getenv("DB_NAME", "student_db")
     db_user = os.getenv("DB_USER", "postgres")
     db_password = os.getenv("DB_PASSWORD", "")
-    database_url = os.getenv("DATABASE_URL")
 
-    # If DATABASE_URL is provided and DB_PASSWORD is default or empty, use DATABASE_URL
-    if database_url and (not db_password or db_password == "your_password"):
-        return psycopg2.connect(database_url)
+    # Priority 1: DATABASE_URL (provided by Nostromo or cloud hosting)
+    if database_url:
+        try:
+            return psycopg2.connect(database_url)
+        except Exception as e:
+            # If DATABASE_URL fails, attempt fallback to individual variables
+            if db_password and db_password != "your_password":
+                return psycopg2.connect(
+                    host=db_host,
+                    port=db_port,
+                    dbname=db_name,
+                    user=db_user,
+                    password=db_password
+                )
+            raise e
 
-    # Standard connection using individual environment variables
+    # Priority 2: Individual connection settings
     return psycopg2.connect(
         host=db_host,
         port=db_port,
@@ -64,7 +79,6 @@ def init_db():
         if conn:
             conn.rollback()
         print(f"Warning/Error during database initialization: {e}")
-        # Note: Do not crash immediately so helpful instructions can be displayed to user
         raise e
     finally:
         if conn:

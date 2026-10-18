@@ -71,6 +71,27 @@ def validate_student_data(data, is_update=False):
     return True, None, cleaned_data
 
 
+
+_db_initialized = False
+
+
+def ensure_db_initialized():
+    """Ensures database tables exist without crashing if connection is temporarily unavailable."""
+    global _db_initialized
+    if not _db_initialized:
+        try:
+            init_db()
+            _db_initialized = True
+        except Exception as e:
+            print(f"[Notice] Database initialization will be retried on next request: {e}")
+
+
+@app.before_request
+def before_request_check():
+    """Verifies database is initialized before handling incoming request."""
+    ensure_db_initialized()
+
+
 # ---------------------------------------------------------
 # Web Routes
 # ---------------------------------------------------------
@@ -78,6 +99,7 @@ def validate_student_data(data, is_update=False):
 def index():
     """Serves the main single-page application dashboard."""
     return render_template("index.html")
+
 
 
 # ---------------------------------------------------------
@@ -409,6 +431,6 @@ if __name__ == "__main__":
         print("Update your .env file with your PostgreSQL password.")
         print("=" * 60 + "\n")
 
-    port = int(os.getenv("PORT", 5000))
-    print(f"Starting Student Records Management System on http://127.0.0.1:{port}")
-    app.run(host="0.0.0.0", port=port, debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    print(f"Starting Student Records Management System on http://0.0.0.0:{port}")
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
