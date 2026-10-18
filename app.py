@@ -251,9 +251,9 @@ if __name__ == "__main__":
     else:
         print(f"  [NOTICE] Schema verification pending: {msg}")
         print("  You can update your .env file at any time without changing code.")
-    print("=" * 70)
-    print("  Starting Flask Web Server on http://127.0.0.1:5000 ...")
+    port = int(os.environ.get("PORT", 5000))
+    print(f"  Starting Flask Web Server on http://0.0.0.0:{port} ...")
     print("=" * 70)
     
-    # Run development server
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # Run server
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
